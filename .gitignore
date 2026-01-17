@@ -1,0 +1,9 @@
+#Environment variables
+.env
+
+#Python cache
+__pychache__/
+*.pyc
+
+#Logs
+analysis_logs.json
