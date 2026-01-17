@@ -25,7 +25,7 @@ This integration and combination improves detection robustness, confidence calib
 
 ## System Architecture
 <p align="center">
-  <img src="assets/architecture.png" alt="GenDetective System Architecture" width="890">
+  <img src="assets/system_architecture.png" alt="GenDetective System Architecture" width="890">
 </p>
 
 ## Tech Stack
