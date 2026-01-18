@@ -23,6 +23,15 @@ This integration and combination improves detection robustness, confidence calib
 - Logistic regression for fast & interpretable inference
 - No external API required for text detection
 
+### 🔐Logs
+Each entry is documented in an analysis_logs.json file which is created after using the extension for the first time.
+For each entry following parameters are present in the logs:
+- type
+- classification
+- confidence score
+- justification
+- forensic factors
+
 ## System Architecture
 <p align="center">
   <img src="assets/system_architecture.png" alt="GenDetective System Architecture" width="890">
