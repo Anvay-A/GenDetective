@@ -72,6 +72,7 @@ GEMINI_API_KEY=your_api_key_here
 ```
 Get your personal Gemini API key from Google AI Studio
 
+***First load the Extension by following the steps below then run the backend**
 
 **Run the backend**
 ```bash
