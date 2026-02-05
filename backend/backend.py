@@ -4,6 +4,7 @@ import sys
 import time
 import base64
 import tempfile
+import json
 from typing import List, Optional, Dict, Any, Tuple
 
 import numpy as np
@@ -553,8 +554,13 @@ def build_image_prompt_enhanced(feat_text: str, heuristic_score: float, factors:
     system_instruction = (
         "You are a forensic AI image detection specialist. "
         "You should combine visual inspection with the provided technical metrics. "
+        "Search everything within the image for minute details that may indicate AI generation. "
+        "Compare the image with real life scenarios and check wether it makes sense. "
         "Treat each heuristic feature as a weak signal: it can appear in both AI-generated and real images. "
         "Your goal is to give a balanced judgement about whether the image is AI-generated or real."
+        """If the image appears highly realistic and physically plausible with no clear artifacts,
+        prefer an "Inconclusive" or "No strong AI indicators" judgment rather than assuming real origin."""
+
     )
 
     factors_text = "\n".join(f"- {f}" for f in factors) if factors else "- (No notable heuristic cues)"
@@ -607,6 +613,27 @@ def build_video_prompt_enhanced(stats_text: str, heuristic_score: float, factors
         "Use lower confidence or 'Inconclusive' if video quality is low or signals are contradictory."
     )
     return system_instruction, user_prompt
+
+def build_text_prompt_enhanced(text: str) -> str:
+    return (
+        "You are a forensic linguistic analyst.\n\n"
+        "Classify the following text based on writing characteristics.\n\n"
+        "Focus on:\n"
+        "- Sentence uniformity\n"
+        "- Predictability of phrasing\n"
+        "- Generic or templated expressions\n"
+        "- Presence of personal nuance or inconsistency\n"
+        "- Natural human imperfections\n\n"
+        "Return ONLY valid JSON:\n"
+        "{\n"
+        '  "verdict": "AI" | "Human" | "Uncertain",\n'
+        '  "confidence": "High" | "Medium" | "Low",\n'
+        '  "signals": [string, ...]\n'
+        "}\n\n"
+        "TEXT:\n"
+        f'"""\n{text}\n"""'
+    )
+
 
 # ENSEMBLE
 
@@ -809,49 +836,171 @@ def get_statistical_features(texts):
 detector_mod.get_statistical_features = get_statistical_features
 sys.modules["detector"] = detector_mod
 
-print("📌 Loading AI Text Detection Model...")
+print("Loading AI Text Detection Model...")
 try:
     TEXT_MODEL = joblib_load("ai_detector_improved_model.joblib")
-    print("✅ Text model loaded.")
+    print("Text model loaded.")
 except Exception as e:
-    print(f"⚠️ Text model load failed: {e}")
+    print(f" Text model load failed: {e}")
     TEXT_MODEL = None
+
+def build_text_reasoning(verdict: str, signals: List[str]) -> str:
+    """
+    Build a clean, user-facing reasoning string.
+    Internal model details are hidden.
+    """
+    if verdict == "AI":
+        base = (
+            "The text exhibits characteristics commonly associated with AI-generated content, "
+            "such as uniform writing quality, predictable phrasing, and a lack of personal nuance."
+        )
+    elif verdict == "Human":
+        base = (
+            "The text shows natural variation in language, minor imperfections, and contextual nuance, "
+            "which are typical of human-written content."
+        )
+    else:
+        base = (
+            "The text contains a mix of characteristics seen in both human and AI-generated writing, "
+            "making a confident determination difficult."
+        )
+
+    if signals:
+        examples = "; ".join(signals[:2])
+        return f"{base} Key observations include: {examples}."
+    return base
+
 
 def classify_text_ai(content: str) -> DetectionResult:
     if TEXT_MODEL is None:
         raise RuntimeError("Text model not loaded")
+
     probs = TEXT_MODEL.predict_proba([content])[0]
-    human_pct = float(probs[0] * 100)
-    ai_pct = float(probs[1] * 100)
-    confidence = int(round(max(human_pct, ai_pct)))
+    ml_ai_pct = float(probs[1] * 100)
 
-    if ai_pct > 80:
-        label = "Very likely AI-generated text"
-    elif ai_pct > 60:
-        label = "Leaning AI-generated text"
-    elif ai_pct > 40:
-        label = "Inconclusive / mixed signals"
-    elif ai_pct > 20:
-        label = "Leaning human-written text"
+    length = len(content.split())
+    length_factor = min(1.0, length / 150)
+    ml_ai_adj = ml_ai_pct * length_factor
+
+    gem = gemini_text_analysis(content)
+    gem_verdict = gem.get("verdict", "Uncertain")   
+    gem_signals = gem.get("signals", [])
+
+    if gem_verdict == "AI":
+        gem_nudge = +10
+    elif gem_verdict == "Human":
+        gem_nudge = -10
     else:
-        label = "Very likely human-written text"
+        gem_nudge = 0
 
-    justification = (
-        "The classifier uses TF-IDF character n-grams and stylometric features "
-        "(sentence length variance, lexical diversity, and punctuation patterns) "
-        "to estimate whether the text resembles AI-generated output or human writing."
-    )
-    factors = [
-        f"AI score: {ai_pct:.1f}%",
-        f"Human score: {human_pct:.1f}%",
-    ]
+    final_ai_score = max(0.0, min(100.0, ml_ai_adj + gem_nudge))
+    confidence = int(round(max(final_ai_score, 100 - final_ai_score)))
+
+    if final_ai_score >= 80:
+        classification = "AI-generated"
+        explanation_base = (
+            "The text exhibits strong statistical and stylistic patterns commonly associated "
+            "with AI-generated writing. These include consistent sentence structure, predictable "
+            "language flow, and a lack of natural irregularities typically found in spontaneous "
+            "human-authored text. Taken together, these signals suggest a high likelihood of AI involvement."
+        )
+
+    elif final_ai_score >= 60:
+        classification = "Likely AI-generated (human-like)"
+        explanation_base = (
+            "The text appears to be AI-generated while incorporating variation and phrasing that "
+            "closely resemble human writing. Modern AI systems are capable of producing such human-like "
+            "output when explicitly instructed to sound natural, which reduces the visibility of "
+            "traditional AI indicators but does not eliminate them entirely."
+        )
+
+    elif final_ai_score >= 40:
+        classification = "Likely human-written (AI-like)"
+        explanation_base = (
+            "The text appears largely human-written but contains certain patterns that are also "
+            "frequently observed in AI-generated content, such as balanced phrasing or mildly "
+            "formulaic structure. These indicators are weak and not conclusive, suggesting limited "
+            "or ambiguous AI involvement rather than clear generation."
+        )
+
+    else:
+        classification = "Human-written"
+        explanation_base = (
+            "The text does not exhibit strong, detectable indicators of AI generation based on "
+            "statistical analysis and linguistic characteristics. It demonstrates sufficient variability "
+            "and contextual coherence to avoid common AI detection signals. However, the absence of "
+            "detectable indicators does not guarantee human authorship, as advanced AI systems can "
+            "produce similar patterns when prompted carefully."
+        )
+
+    if gem_signals:
+        examples = "; ".join(gem_signals[:2])
+        justification = f"{explanation_base} Key observations include: {examples}."
+    else:
+        justification = explanation_base
+
     return DetectionResult(
-        classification=label,
+        classification=classification,
         confidenceScore=confidence,
         justification=justification,
-        forensicFactors=factors,
-        heuristicScore=None,
+        forensicFactors=[],  
+        geminiOpinion=None,
+        heuristicScore=round(final_ai_score, 2),
     )
+
+def gemini_verdict_to_score(verdict: str) -> float:
+    if verdict == "AI":
+        return 94.0
+    if verdict == "Human":
+        return 10.0
+    return 50.0
+
+def gemini_text_analysis(content: str) -> Dict[str, Any]:
+    prompt = build_text_prompt_enhanced(content)
+
+    try:
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[prompt],
+            config=gtypes.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.15,
+            ),
+        )
+        import json
+        parsed = json.loads(resp.text)
+
+        return {
+            "verdict": parsed.get("verdict", "Uncertain"),
+            "confidence": parsed.get("confidence", "Low"),
+            "signals": parsed.get("signals", []),
+        }
+
+    except Exception as e:
+        print(f"Gemini text analysis failed: {e}")
+        return {
+            "verdict": "Uncertain",
+            "confidence": "Low",
+            "signals": [],
+        }
+    
+def ml_text_score(content: str) -> Dict[str, float]:
+    probs = TEXT_MODEL.predict_proba([content])[0]
+    ai_pct = probs[1] * 100
+
+    length = len(content.split())
+    length_penalty = min(1.0, length / 150)
+
+    adjusted_ai = ai_pct * length_penalty
+
+    return {
+        "ai_pct": adjusted_ai,
+        "raw_ai_pct": ai_pct,
+        "length": length,
+    }
+
+
+
 
 # ROUTES
 
